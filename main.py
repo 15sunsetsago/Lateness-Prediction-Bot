@@ -36,6 +36,7 @@ def get_user(user_id):  #just in case if we wanna log other latness
 auto_timers={}
 manual_timers={}
 
+#create event with auto start
 @bot.tree.command(name = "event_create", description = "Insert event")
 async def event_create(
     interaction: discord.Interaction,
@@ -47,20 +48,21 @@ async def event_create(
     user_id = str(interaction.user.id)
     user = get_user(user_id)
 
-    datetime_str = f"{date}{time_str}"
+    datetime_str = f"{date} {time_str}"
 
     event = {
         "name": name,
         "datetime": datetime_str,
         "channel_id": channel.id if channel else None,
-        "lateness": None
+        "lateness": None,
+        "started": False
     }
 
     user["events"].append(event)
     save_data(data)
 
     await interaction.response.send_message(
-        f"Event '{name}' created for {datetime_str}"+(f" in {channel.name}" if channel else ""), ephermeral = True
+        f"Event '{name}' created for {datetime_str}"+(f" in {channel.name}" if channel else ""), ephemeral = True
     )
 
 #manual start and stop
@@ -122,4 +124,32 @@ async def event_late_stop(interaction: discord.Interaction):
         ephemeral=True
     )
 
-#timer stats
+#autostart
+@tasks.loop(seconds = 30)
+async def auto_start_events():
+    now = datetime.now()
+    
+    for user_id, user_data in data.items():
+        for event in user_data["events"]:
+            if event.get("started"):
+                continue
+            try:
+                event_time = datetime.strptime(event["datetime"], "%Y-%m-%d %H:%M")
+            except:
+                continue
+    if now>= event_time:
+        event["started"] = True
+        auto_timers[user_id] = {
+            "start": time.time(),
+            "event_name": event["name"]
+        }
+        print(f"Auto-started timer for {event['name']} ({user_id})")
+
+    save_data()
+
+@bot.event
+async def on_ready():
+    auto_start_events.start()
+    print(f"Logged in as {bot.user}")
+
+bot.run("TOKEN") #replace when testing bot
