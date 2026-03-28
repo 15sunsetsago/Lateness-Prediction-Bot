@@ -43,9 +43,10 @@ async def event_create(
     name: str,
     date: str,  
     time_str: str,
+    member: discord.Member,
     channel: discord.VoiceChannel = None
 ):
-    user_id = str(interaction.user.id)
+    user_id = str(member.id)
     user = get_user(user_id)
 
     datetime_str = f"{date} {time_str}"
@@ -59,7 +60,7 @@ async def event_create(
     }
 
     user["events"].append(event)
-    save_data(data)
+    save_data()
 
     await interaction.response.send_message(
         f"Event '{name}' created for {datetime_str}"+(f" in {channel.name}" if channel else ""), ephemeral = True
@@ -117,7 +118,7 @@ async def event_late_stop(interaction: discord.Interaction):
         }
         user["events"].append(event)
 
-    save_data(data)
+    save_data()
 
     await interaction.response.send_message(
         f" {user} late for {late_seconds} seconds for '{timer['event_name']}'",
