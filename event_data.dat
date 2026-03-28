@@ -1,0 +1,40 @@
+{
+    "660471853076316171": {
+        "events": [
+            {
+                "name": "test",
+                "datetime": "3-28-2026 4:00",
+                "channel_id": 889666686242930733,
+                "lateness": null,
+                "started": false
+            },
+            {
+                "name": "test_start",
+                "datetime": "3-28-2026 3:41",
+                "channel_id": 889666686242930733,
+                "lateness": null,
+                "started": false
+            },
+            {
+                "name": "test_late",
+                "datetime": "2026-03-28 15:56",
+                "channel_id": 889666686242930733,
+                "lateness": 8758,
+                "started": true
+            }
+        ],
+        "lateness": []
+    },
+    "572153919019548672": {
+        "events": [
+            {
+                "name": "test",
+                "datetime": "3-28-2026 4:00",
+                "channel_id": 889666686242930733,
+                "lateness": null,
+                "started": false
+            }
+        ],
+        "lateness": []
+    }
+}
