@@ -32,8 +32,8 @@ def get_user(user_id):
     return data[user_id]
 
 
-auto_timers = {}  # {user_id: [{event_name, start_time}]}
-manual_timers = {}  # {user_id: {event_name, start_time}}
+auto_timers = {}  
+manual_timers = {}  
 
 #create event
 @bot.tree.command(name="event_create", description="Create an event with date and time")
