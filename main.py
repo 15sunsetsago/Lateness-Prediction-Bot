@@ -1,209 +1,276 @@
 import discord
+import os
 from discord.ext import commands, tasks
 from discord import app_commands, Interaction
-import json
-import time
+import sqlite3
+import json 
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
-# --- SETUP ---
+# setup
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+DB_FILE = "events.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE, timeout=15)
+    c = conn.cursor()
+    try:
+        c.execute('PRAGMA journal_mode=WAL;')
+        c.execute('''CREATE TABLE IF NOT EXISTS events 
+                     (guild_id TEXT, user_id TEXT, username TEXT, name TEXT, time TEXT, lateness INTEGER, started INTEGER)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS schedules 
+                     (guild_id TEXT, user_id TEXT, username TEXT, name TEXT, day_of_week INTEGER, time_24h TEXT)''')
+        
+        # Migration logic for existing DBs
+        try:
+            c.execute("ALTER TABLE events ADD COLUMN guild_id TEXT")
+        except sqlite3.OperationalError: pass
+        try:
+            c.execute("ALTER TABLE schedules ADD COLUMN guild_id TEXT")
+        except sqlite3.OperationalError: pass
+        conn.commit()
+    finally:
+        conn.close()
+
+def query_db(query, args=(), one=False):
+    # Added isolation_level=None for better performance in WAL mode
+    conn = sqlite3.connect(DB_FILE, timeout=20, isolation_level=None) 
+    c = conn.cursor()
+    try:
+        if not query.strip().upper().startswith("SELECT"):
+            c.execute("BEGIN IMMEDIATE") # Forces a write lock immediately to prevent mid-operation deadlocks
+            c.execute(query, args)
+            c.execute("COMMIT")
+            rv = []
+        else:
+            c.execute(query, args)
+            rv = c.fetchall()
+    except Exception as e:
+        if not query.strip().upper().startswith("SELECT"):
+            c.execute("ROLLBACK")
+        raise e
+    finally:
+        conn.close()
+    return (rv[0] if rv else None) if one else rv
+
+init_db()
+
 intents = discord.Intents.default()
 intents.voice_states = True
 intents.members = True
 intents.message_content = True 
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-DATA_FILE = "event_data.dat"
 
-# load and save data
-def load_data():
-    try:
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {}
-
-def save_data():
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
-data = load_data()
-
-def get_user(user_id):
-    if user_id not in data:
-        data[user_id] = {"events": []}
-    return data[user_id]
-
-auto_timers = {} 
-
-class EventGroup(app_commands.Group, name="event"):
-    """All personal event commands"""
-    pass
-
-class AdminGroup(app_commands.Group, name="admin"):
-    """Staff only commands"""
-    pass
+class EventGroup(app_commands.Group, name="event"): pass
+class AdminGroup(app_commands.Group, name="admin"): pass
 
 event_menu = EventGroup()
 admin_menu = AdminGroup()
 
-# /events
+# --- USER COMMANDS ---
 
 @event_menu.command(name="create", description="Manual: Set a specific date and time")
 async def create(interaction: Interaction, name: str, year: int, month: int, day: int, time_24h: str, member: discord.Member = None):
-    target_user = member or interaction.user
-    user_data = get_user(str(target_user.id))
+    target = member or interaction.user
     try:
-        date_str = f"{year}-{month:02d}-{day:02d}"
-        dt_obj = datetime.strptime(f"{date_str} {time_24h}", "%Y-%m-%d %H:%M")
-        event = {"name": name, "datetime": dt_obj.strftime("%Y-%m-%d %H:%M"), "lateness": None, "started": False}
-        user_data["events"].append(event)
-        save_data()
-        await interaction.response.send_message(f"✅ Event **{name}** created for {dt_obj.strftime('%Y-%m-%d %H:%M')}", ephemeral=True)
+        dt_str = f"{year}-{month:02d}-{day:02d} {time_24h}"
+        query_db("INSERT INTO events (guild_id, user_id, username, name, time, lateness, started) VALUES (?, ?, ?, ?, ?, NULL, 0)", 
+                 (str(interaction.guild.id), str(target.id), str(target), name, dt_str))
+        await interaction.response.send_message(f"✅ Event **{name}** created for {target.mention}")
     except:
-        await interaction.response.send_message("❌ Invalid format. Use: YYYY MM DD HH:MM", ephemeral=True)
+        await interaction.response.send_message("❌ Format error. Use: YYYY MM DD HH:MM", ephemeral=True)
 
 @event_menu.command(name="quick", description="Quick: Start in X minutes from now")
 async def quick(interaction: Interaction, name: str, minutes: int = 15, member: discord.Member = None):
-    target_user = member or interaction.user
-    user_data = get_user(str(target_user.id))
-    future_time = datetime.now() + timedelta(minutes=minutes)
-    event = {"name": name, "datetime": future_time.strftime("%Y-%m-%d %H:%M"), "lateness": None, "started": False}
-    user_data["events"].append(event)
-    save_data()
-    await interaction.response.send_message(f" **Quick Event:** {name} starts in {minutes}m ({future_time.strftime('%I:%M %p')})", ephemeral=True)
+    target = member or interaction.user
+    dt_str = (datetime.now() + timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M")
+    query_db("INSERT INTO events (guild_id, user_id, username, name, time, lateness, started) VALUES (?, ?, ?, ?, ?, NULL, 0)", 
+             (str(interaction.guild.id), str(target.id), str(target), name, dt_str))
+    await interaction.response.send_message(f"**Quick Event** '{name}' starts in {minutes}m for {target.mention}")
 
-@event_menu.command(name="list", description="List your events and recorded lateness")
+@event_menu.command(name="list", description="List events and recorded lateness")
 async def list_events(interaction: Interaction, member: discord.Member = None):
     target = member or interaction.user
-    user = get_user(str(target.id))
-    if not user["events"]:
-        return await interaction.response.send_message(f"📅 {target.display_name} has no events.", ephemeral=True)
-
+    rows = query_db("SELECT name, time, lateness, started FROM events WHERE user_id = ? AND guild_id = ?", 
+                    (str(target.id), str(interaction.guild.id)))
+    if not rows: return await interaction.response.send_message(f"📅 No events here for {target.display_name}", ephemeral=True)
     msg = f"📅 **{target.display_name}'s Events:**\n"
-    for i, e in enumerate(user["events"], 1):
-        if e.get("lateness") is not None:
-            m, s = divmod(e["lateness"], 60)
-            status = f"Scheduled: {e['datetime']} \n ✅ **Late: {m}m {s}s**"
-        elif e.get("started"):
-            status = "Scheduled: {e['datetime']} ⏳ **Ongoing (Clock Running **Late: {m}m {s}s** )**"
-        else:
-            status = f" Scheduled: {e['datetime']}"
-        msg += f"{i}. **{e['name']}** — {status}\n"
+    for i, (name, timestamp, late, started) in enumerate(rows, 1):
+        status = f"{timestamp} ✅ Late: {late//60}m" if late is not None else (f"{timestamp} ⏳ Ongoing" if started else f"🕒 {timestamp}")
+        msg += f"{i}. **{name}** — {status}\n"
     await interaction.response.send_message(msg, ephemeral=True)
 
 @event_menu.command(name="stop", description="Manually stop the active timer")
-async def stop(interaction: Interaction, name: str = None):
-    user_id = str(interaction.user.id)
-    user = get_user(user_id)
-    timers = auto_timers.get(user_id, [])
-    timer = next((t for t in timers if t["event_name"] == name), timers[0]) if (timers and name) else (timers[0] if timers else None)
-    
-    target_event = None
-    late_sec = 0
-
-    if timer:
-        late_sec = int(time.time() - timer["start"])
-        target_event = next((e for e in user["events"] if e["name"] == timer["event_name"] and e.get("lateness") is None), None)
-        auto_timers[user_id] = [t for t in timers if t != timer]
-    else:
-        for e in user["events"]:
-            if (name is None or e["name"] == name) and e.get("started") and e.get("lateness") is None:
-                target_event = e
-                start_dt = datetime.strptime(e["datetime"], "%Y-%m-%d %H:%M")
-                late_sec = int((datetime.now() - start_dt).total_seconds())
-                break
-
-    if not target_event:
-        return await interaction.response.send_message("❌ No active event found.", ephemeral=True)
-
-    target_event["lateness"] = late_sec
-    save_data()
-    m, s = divmod(late_sec, 60)
-    await interaction.response.send_message(f"Stopped '{target_event['name']}'. Lateness: {m}m {s}s", ephemeral=True)
+async def stop(interaction: Interaction, name: str):
+    uid, gid = str(interaction.user.id), str(interaction.guild.id)
+    row = query_db("SELECT time FROM events WHERE user_id = ? AND guild_id = ? AND name = ? AND started = 1 AND lateness IS NULL", (uid, gid, name), one=True)
+    if not row: return await interaction.response.send_message("❌ No active event found.", ephemeral=True)
+    late = int((datetime.now() - datetime.strptime(row[0], "%Y-%m-%d %H:%M")).total_seconds())
+    query_db("UPDATE events SET lateness = ?, started = 0 WHERE user_id = ? AND guild_id = ? AND name = ?", (late, uid, gid, name))
+    await interaction.response.send_message(f" Stopped '{name}'.", ephemeral=True)
 
 @event_menu.command(name="delete", description="Delete one of your events")
 async def delete(interaction: Interaction, name: str):
-    user = get_user(str(interaction.user.id))
-    user["events"] = [e for e in user["events"] if e["name"] != name]
-    save_data()
-    await interaction.response.send_message(f" Deleted event: '{name}'", ephemeral=True)
+    # 1. Tell Discord to wait (prevents 404 Unknown Interaction)
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        query_db("DELETE FROM events WHERE user_id = ? AND guild_id = ? AND name = ?", 
+                 (str(interaction.user.id), str(interaction.guild.id), name))
+        # 2. Use followups for deferred messages
+        await interaction.followup.send(f" Deleted event: '{name}'")
+    except sqlite3.OperationalError:
+        await interaction.followup.send("❌ Database is currently busy. Please try again in a few seconds.")
 
-@event_menu.command(name="clear", description="Clear all your events")
+
+@event_menu.command(name="clear", description="Clear all your events in this server")
 async def clear(interaction: Interaction):
-    data[str(interaction.user.id)]["events"] = []
-    save_data()
-    await interaction.response.send_message(" All your events have been cleared.", ephemeral=True)
+    query_db("DELETE FROM events WHERE user_id = ? AND guild_id = ?", (str(interaction.user.id), str(interaction.guild.id)))
+    await interaction.response.send_message(" Your events in this server cleared.", ephemeral=True)
 
-# /admin
+@event_menu.command(name="list_all", description="View everyone's events in this server")
+async def list_all(interaction: Interaction):
+    rows = query_db("SELECT user_id, username, name, time, lateness, started FROM events WHERE guild_id = ? ORDER BY user_id ASC", (str(interaction.guild.id),))
+    if not rows: return await interaction.response.send_message("📅 No events found in this server.", ephemeral=True)
+    msg = f" **{interaction.guild.name} Event Board**\n"
+    curr = None
+    for uid, uname, name, timestamp, late, started in rows:
+        if uid != curr:
+            curr = uid
+            msg += f"\n👤 **{uname or f'<@{uid}>'}**\n"
+        status = f" {timestamp} ✅ Late: {late//60}m" if late is not None else (f" {timestamp} ⏳ Ongoing" if started else f"🕒 {timestamp}")
+        msg += f" └ **{name}** — {status}\n"
+    await interaction.response.send_message(msg)
 
-@admin_menu.command(name="delete", description="Admin: Delete a specific event for a user")
+@event_menu.command(name="add_schedule", description="Set a recurring weekly event")
+async def add_schedule(interaction: Interaction, name: str, day: str, time_24h: str):
+    days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    day = day.lower().strip()
+    if day not in days: return await interaction.response.send_message("❌ Invalid day.", ephemeral=True)
+    query_db("INSERT INTO schedules (guild_id, user_id, username, name, day_of_week, time_24h) VALUES (?, ?, ?, ?, ?, ?)", 
+             (str(interaction.guild.id), str(interaction.user.id), str(interaction.user), name, days.index(day), time_24h))
+    await interaction.response.send_message(f"🗓️ Recurring: **{name}** every {day.capitalize()} at {time_24h}.")
+
+@event_menu.command(name="delete_schedule", description="Delete a recurring schedule")
+async def delete_schedule(interaction: Interaction, name: str):
+    query_db("DELETE FROM schedules WHERE user_id = ? AND guild_id = ? AND name = ?", (str(interaction.user.id), str(interaction.guild.id), name))
+    await interaction.response.send_message(f" Deleted schedule: {name}", ephemeral=True)
+
+# --- ADMIN COMMANDS ---
+
+@admin_menu.command(name="delete", description="Admin: Delete event from other user")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def admin_delete(interaction: Interaction, member: discord.Member, event_name: str):
-    uid = str(member.id)
-    if uid in data:
-        original_len = len(data[uid]["events"])
-        data[uid]["events"] = [e for e in data[uid]["events"] if e["name"] != event_name]
-        if len(data[uid]["events"]) < original_len:
-            save_data()
-            return await interaction.response.send_message(f"✅ Admin: Deleted '{event_name}' for {member.display_name}.", ephemeral=True)
-    await interaction.response.send_message(f"❌ Admin: Event '{event_name}' not found for {member.display_name}.", ephemeral=True)
+    query_db("DELETE FROM events WHERE user_id = ? AND guild_id = ? AND name = ?", (str(member.id), str(interaction.guild.id), event_name))
+    await interaction.response.send_message(f" Admin: Deleted '{event_name}' for {member.display_name}")
 
-@admin_menu.command(name="clear", description="Admin: Wipe all data for a user")
+@admin_menu.command(name="clear", description="Admin: Clear all user data in this server")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def admin_clear(interaction: Interaction, member: discord.Member):
-    uid = str(member.id)
-    if uid in data:
-        data[uid]["events"] = []
-        auto_timers.pop(uid, None)
-        save_data()
-        await interaction.response.send_message(f" Admin: Cleared all data for {member.display_name}", ephemeral=True)
-    else:
-        await interaction.response.send_message("❌ User has no data.", ephemeral=True)
+    query_db("DELETE FROM events WHERE user_id = ? AND guild_id = ?", (str(member.id), str(interaction.guild.id)))
+    await interaction.response.send_message(f" Admin: Cleared data for {member.display_name}")
 
+@admin_menu.command(name="stop", description="Admin: Force stop a user's timer")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def admin_stop(interaction: Interaction, member: discord.Member, name: str):
+    uid, gid = str(member.id), str(interaction.guild.id)
+    row = query_db("SELECT time FROM events WHERE user_id = ? AND guild_id = ? AND name = ? AND started = 1", (uid, gid, name), one=True)
+    if not row: return await interaction.response.send_message("❌ Active event not found.")
+    late = int((datetime.now() - datetime.strptime(row[0], "%Y-%m-%d %H:%M")).total_seconds())
+    query_db("UPDATE events SET lateness = ?, started = 0 WHERE user_id = ? AND guild_id = ? AND name = ?", (late, uid, gid, name))
+    await interaction.response.send_message(f"Force Stopped '{name}' for {member.mention}. Late: {late//60}m")
 
-bot.tree.add_command(event_menu)
-bot.tree.add_command(admin_menu)
+@admin_menu.command(name="add_record", description="Admin: Add a finished event record")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def admin_add_record(interaction: Interaction, member: discord.Member, name: str, lateness_minutes: int, date_str: str = None):
+    if not date_str: date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    query_db("INSERT INTO events (guild_id, user_id, username, name, time, lateness, started) VALUES (?, ?, ?, ?, ?, ?, 0)", 
+             (str(interaction.guild.id), str(member.id), str(member), name, date_str, lateness_minutes * 60))
+    await interaction.response.send_message(f"✅ Added record for {member.display_name}.")
 
+@admin_menu.command(name="add_schedule", description="Admin: Add schedule for member")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def admin_add_schedule(interaction: Interaction, member: discord.Member, name: str, day: str, time_24h: str):
+    days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    day = day.lower().strip()
+    if day not in days: return await interaction.response.send_message("❌ Invalid day.")
+    query_db("INSERT INTO schedules (guild_id, user_id, username, name, day_of_week, time_24h) VALUES (?, ?, ?, ?, ?, ?)", 
+             (str(interaction.guild.id), str(member.id), str(member), name, days.index(day), time_24h))
+    await interaction.response.send_message(f"🗓️ Admin set schedule for {member.display_name}")
 
-#auto start
-@tasks.loop(seconds=10)
-async def auto_start_events():
+@admin_menu.command(name="delete_user_schedule", description="Admin: Delete user schedule")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def admin_delete_user_schedule(interaction: Interaction, member: discord.Member, name: str):
+    query_db("DELETE FROM schedules WHERE user_id = ? AND guild_id = ? AND name = ?", (str(member.id), str(interaction.guild.id), name))
+    await interaction.response.send_message(f" Admin deleted schedule for {member.display_name}")
+
+# --- SYSTEM COMMANDS ---
+
+@admin_menu.command(name="export", description="Export server data to JSON")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def admin_export(interaction: Interaction):
+    rows = query_db("SELECT * FROM events WHERE guild_id = ?", (str(interaction.guild.id),))
+    data = [{"gid": r[0], "uid": r[1], "user": r[2], "name": r[3], "time": r[4], "late": r[5], "start": r[6]} for r in rows]
+    with open(f"export_{interaction.guild.id}.json", "w") as f: json.dump(data, f, indent=4)
+    await interaction.response.send_message("✅ Exported!", file=discord.File(f"export_{interaction.guild.id}.json"), ephemeral=True)
+
+@admin_menu.command(name="import", description="Import from JSON string")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def admin_import(interaction: Interaction, json_data: str):
+    try:
+        data = json.loads(json_data)
+        for e in data:
+            query_db("INSERT INTO events (guild_id, user_id, username, name, time, lateness, started) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+                     (e.get('gid', str(interaction.guild.id)), e['uid'], e.get('user', 'Unknown'), e['name'], e['time'], e['late'], e['start']))
+        await interaction.response.send_message("✅ Imported successfully!", ephemeral=True)
+    except Exception as ex: await interaction.response.send_message(f"❌ Error: {ex}", ephemeral=True)
+
+# --- LOOPS & AUTOMATION ---
+
+@tasks.loop(seconds=20)
+async def auto_check():
     now = datetime.now()
-    for uid, udata in data.items():
-        for e in udata["events"]:
-            if e.get("started") or e.get("lateness") is not None: continue
-            try:
-                if now >= datetime.strptime(e["datetime"], "%Y-%m-%d %H:%M"):
-                    e["started"] = True
-                    auto_timers.setdefault(uid, []).append({"event_name": e["name"], "start": time.time()})
-                    user_obj = await bot.fetch_user(int(uid))
-                    await user_obj.send(f"⚠️ **{e['name']}** has started! Join Voice.")
-            except: continue
-    save_data()
+    now_str, day_idx, time_str, date_only = now.strftime("%Y-%m-%d %H:%M"), now.weekday(), now.strftime("%H:%M"), now.strftime("%Y-%m-%d")
+    
+    recurring = query_db("SELECT guild_id, user_id, username, name FROM schedules WHERE day_of_week = ? AND time_24h = ?", (day_idx, time_str))
+    if recurring:
+        for gid, uid, uname, name in recurring:
+            if not query_db("SELECT name FROM events WHERE guild_id = ? AND user_id = ? AND name = ? AND time LIKE ?", (gid, uid, name, f"{date_only}%"), one=True):
+                query_db("INSERT INTO events (guild_id, user_id, username, name, time, lateness, started) VALUES (?, ?, ?, ?, ?, NULL, 1)", (gid, uid, uname, name, now_str))
+                try: 
+                    user = await bot.fetch_user(int(uid))
+                    await user.send(f"⏰ **Scheduled Event Started:** {name}")
+                except: pass
 
-#auto stop when joining vc
+    pending = query_db("SELECT user_id, name, guild_id FROM events WHERE time <= ? AND started = 0 AND lateness IS NULL", (now_str,))
+    if pending:
+        for uid, name, gid in pending:
+            query_db("UPDATE events SET started = 1 WHERE user_id = ? AND guild_id = ? AND name = ?", (uid, gid, name))
+            try: 
+                user = await bot.fetch_user(int(uid))
+                await user.send(f"⚠️ **Event Starting Now:** {name}")
+            except: pass
+
 @bot.event
 async def on_voice_state_update(member, before, after):
-    uid = str(member.id)
     if before.channel is None and after.channel is not None:
-        timers = auto_timers.get(uid, [])
-        if timers:
-            chan = discord.utils.get(member.guild.text_channels, name="general")
-            for t in timers:
-                late = int(time.time() - t["start"])
-                user = get_user(uid)
-                for e in user["events"]:
-                    if e["name"] == t["event_name"] and e.get("lateness") is None:
-                        e["lateness"] = late
-                if chan: await chan.send(f" {member.mention} arrived! Late for **{t['event_name']}**: {late//60}m {late%60}s")
-            auto_timers[uid] = []
-            save_data()
+        gid, uid = str(member.guild.id), str(member.id)
+        active = query_db("SELECT name, time FROM events WHERE user_id = ? AND guild_id = ? AND started = 1 AND lateness IS NULL", (uid, gid))
+        if active:
+            for name, timestamp in active:
+                late = int((datetime.now() - datetime.strptime(timestamp, "%Y-%m-%d %H:%M")).total_seconds())
+                query_db("UPDATE events SET lateness = ?, started = 0 WHERE user_id = ? AND guild_id = ? AND name = ?", (late, uid, gid, name))
+                chan = discord.utils.get(member.guild.text_channels, name="general")
+                if chan: await chan.send(f"✅ {member.mention} arrived! Late for **{name}**: {late//60}m {late%60}s")
 
 @bot.event
 async def on_ready():
-    await bot.tree.sync() 
-    if not auto_start_events.is_running():
-        auto_start_events.start()
-    print(f" {bot.user} is online and fully restored")
+    bot.tree.add_command(event_menu)
+    bot.tree.add_command(admin_menu)
+    await bot.tree.sync()
+    if not auto_check.is_running(): auto_check.start()
+    print(f"Logged in as {bot.user}")
 
-bot.run("token")
+bot.run(TOKEN)
