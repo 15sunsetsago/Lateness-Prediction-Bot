@@ -568,15 +568,18 @@ class AdvancedMemberPicker(discord.ui.View):
 
         mode_txt = "VC or Button" if self.checkin_opt == 1 else "Button Only"
         
-        await interaction.followup.send(
-            f"📅 **Advanced Event Created!**\n"
-            f"**Name:** {self.name}\n"
-            f"**Time:** {self.dt_str}\n"
-            f"**Method:** {mode_txt} | **Reminder:** {self.reminder_offset}m\n"
-            f"**Grace:** {self.grace_minutes}m\n" if self.grace_minutes else ""
-            f"**Participants:** {' '.join(mentions)}",
-            ephemeral=False
-        )
+        response_text = (
+                    f"📅 **Advanced Event Created!**\n"
+                    f"**Name:** {self.name}\n"
+                    f"**Time:** {self.dt_str}\n"
+                    f"**Method:** {mode_txt} | **Reminder:** {self.reminder_offset}m\n"
+                )
+        if self.grace_minutes:
+            response_text += f"**Grace:** {self.grace_minutes}m\n"
+        
+        response_text += f"**Participants:** {' '.join(mentions)}"
+
+        await interaction.followup.send(response_text, ephemeral=False)
 
     async def on_timeout(self):
         """Greys out the menu if they walk away"""
@@ -702,12 +705,15 @@ class QuickMemberPicker(discord.ui.View):
         h, m = self.minutes // 60, self.minutes % 60
         dur = f"{h}h {m}m" if h > 0 else f"{m}m"
         
-        await interaction.followup.send(
+        grace_txt = f"**Grace:** {self.grace_minutes}m\n" if self.grace_minutes else ""
+        
+        response_text = (
             f"✅ Quick event '**{self.name}**' set for **{self.dt_str}** ({dur} from now)!\n"
-            + (f"**Grace:** {self.grace_minutes}m" if self.grace_minutes else "")
-            +f"**Participants:** {' '.join(mentions)}",
-            ephemeral=False
+            f"{grace_txt}"
+            f"**Participants:** {' '.join(mentions)}"
         )
+
+        await interaction.followup.send(response_text, ephemeral=False)
 
 
 @event_menu.command(name="create_quick", description="Quick: 2-step event setup for 'now'")
