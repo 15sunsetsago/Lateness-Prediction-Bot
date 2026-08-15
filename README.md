@@ -1,4 +1,4 @@
-﻿#  Remembrall | 
+﻿#  Remembrall 
 ### *Machine Learning Powered Prediction & Event tracking/Analysis*
 
 [![Status](https://img.shields.io/badge/Version-3.0_Stable-blueviolet.svg)](#)
